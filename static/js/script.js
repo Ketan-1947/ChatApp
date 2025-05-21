@@ -19,7 +19,7 @@ function addSystemMessage(message) {
 }
 
 // Initial system message
-addSystemMessage("Hello! Please upload a PDF document so I can answer questions about it.");
+addSystemMessage("Hello! I can help you with general questions or analyze PDF documents. You can upload a PDF or just ask me anything!");
 
 // Allow sending message with Enter key
 messageInput.addEventListener("keypress", function(event) {
@@ -93,6 +93,19 @@ function getCurrentTime() {
   return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function getSourceIndicator(source) {
+  switch(source) {
+    case 'pdf':
+      return '📄 PDF Answer';
+    case 'general':
+      return '🤖 General Answer';
+    case 'summary':
+      return '📝 Summary';
+    default:
+      return '';
+  }
+}
+
 async function sendMessage() {
   const messageText = messageInput.value.trim();
   const file = fileUpload.files[0];
@@ -141,7 +154,20 @@ async function sendMessage() {
     // Show bot reply
     const botMsg = document.createElement("div");
     botMsg.className = "message bot";
-    botMsg.textContent = data.reply;
+    
+    // Add source indicator if available
+    if (data.source) {
+      const sourceIndicator = document.createElement("div");
+      sourceIndicator.className = "source-indicator";
+      sourceIndicator.textContent = getSourceIndicator(data.source);
+      botMsg.appendChild(sourceIndicator);
+    }
+    
+    // Add the message content
+    const messageContent = document.createElement("div");
+    messageContent.className = "message-content";
+    messageContent.textContent = data.reply;
+    botMsg.appendChild(messageContent);
     
     const botTimeStamp = document.createElement("div");
     botTimeStamp.className = "time-stamp";

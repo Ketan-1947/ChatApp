@@ -2,11 +2,14 @@ import os
 # Set environment variable to avoid OpenMP conflicts
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModel
-from pypdf import PdfReader
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.text_splitter import SpacyTextSplitter
+from langchain.llms import HuggingFacePipeline
+from langchain.chains import RetrievalQA, LLMChain
+from langchain.prompts import PromptTemplate
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 import torch
-import faiss
-import spacy
 import logging
 from tqdm import tqdm
 import numpy as np
@@ -21,29 +24,66 @@ class RAG:
         """Initialize the RAG model with specified embedding and generator models."""
         try:
             logger.info(f"Initializing RAG with embedding model: {sent_model_name}")
-            self.sent_tokenizer = AutoTokenizer.from_pretrained(sent_model_name)
-            self.sent_embeddings = AutoModel.from_pretrained(sent_model_name)
+            # Initialize embeddings
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=sent_model_name,
+                model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+            )
             
-            logger.info("Loading spaCy model for sentence breaking")
-            self.sentence_breaker = spacy.load("en_core_web_sm")
+            # Initialize text splitter
+            logger.info("Initializing text splitter")
+            self.text_splitter = SpacyTextSplitter(
+                pipeline="en_core_web_sm",
+                chunk_size=128,
+                chunk_overlap=32
+            )
             
+            # Initialize generator model
             logger.info(f"Initializing generator model: {generator_model_name}")
-            self.generator_tokenizer = AutoTokenizer.from_pretrained(generator_model_name)
-            self.generator = AutoModelForSeq2SeqLM.from_pretrained(generator_model_name)
-
-            self.sent_embeddings.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(generator_model_name)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(generator_model_name)
             
-            # Set device based on availability
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Using device: {self.device}")
+            # Create pipeline
+            pipe = pipeline(
+                "text2text-generation",
+                model=self.model,
+                tokenizer=self.tokenizer,
+                max_length=512,
+                device=0 if torch.cuda.is_available() else -1
+            )
             
-            self.sent_embeddings.to(self.device)
-            self.generator.to(self.device)
-
-            # Initialize FAISS index for vector search
-            self.embedding_dim = 384  # Default for MiniLM-L6
-            self.db = faiss.IndexFlatL2(self.embedding_dim)
-            self.mapping = None
+            # Initialize LLM
+            self.llm = HuggingFacePipeline(pipeline=pipe)
+            
+            # Initialize vector store
+            self.vectorstore = None
+            
+            # Initialize prompt templates
+            self.pdf_qa_template = PromptTemplate(
+                input_variables=["context", "question"],
+                template="""Use the following context to answer the question. 
+                If you cannot find the answer in the context, say "I cannot find a specific answer in the document."
+                Context: {context}
+                Question: {question}
+                Answer:"""
+            )
+            
+            self.general_qa_template = PromptTemplate(
+                input_variables=["question"],
+                template="""Answer the following question in a clear and informative way. 
+                If you're not sure about something, say so.
+                Question: {question}
+                Answer:"""
+            )
+            
+            self.pdf_summary_template = PromptTemplate(
+                input_variables=["text"],
+                template="""Provide a comprehensive summary of the following document. 
+                Include the main topics, key points, and important details.
+                If the text is too long, focus on the most important information.
+                Text: {text}
+                Summary:"""
+            )
             
             logger.info("RAG model initialized successfully")
         except Exception as e:
@@ -57,139 +97,148 @@ class RAG:
                 raise FileNotFoundError(f"PDF file not found: {pdf_path}")
                 
             logger.info(f"Loading PDF: {pdf_path}")
-            pdf = PdfReader(pdf_path)
+            from langchain.document_loaders import PyPDFLoader
+            loader = PyPDFLoader(pdf_path)
+            documents = loader.load()
             
-            # Extract text from PDF
-            text = ''
-            for i, page in enumerate(tqdm(pdf.pages, desc="Reading PDF pages")):
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text
-                except Exception as e:
-                    logger.warning(f"Error extracting text from page {i}: {str(e)}")
+            # Split documents into chunks
+            logger.info("Splitting documents into chunks")
+            texts = self.text_splitter.split_documents(documents)
+            logger.info(f"Created {len(texts)} text chunks")
             
-            if not text.strip():
-                raise ValueError("Could not extract any text from the PDF")
-                
-            logger.info(f"Extracted {len(text)} characters from PDF")
-            
-            # Create embeddings for the text
-            embeddings, self.mapping = self.get_embeddings(text)
-            logger.info(f"Created embeddings with shape: {embeddings.shape}")
-            
-            # Clear existing index and add new embeddings
-            if self.db.ntotal > 0:
-                self.db.reset()
-            self.db.add(embeddings.cpu().numpy())
-            logger.info(f"Added {self.db.ntotal} vectors to FAISS index")
+            # Create vector store
+            logger.info("Creating vector store")
+            self.vectorstore = FAISS.from_documents(texts, self.embeddings)
+            logger.info(f"Vector store created with {len(texts)} documents")
             
             return True
         except Exception as e:
             logger.error(f"Error loading PDF: {str(e)}")
             raise
-    
-    def get_embeddings(self, text):
-        """Extract embeddings for text content."""
-        try:
-            logger.info("Breaking text into sentences")
-            doc = self.sentence_breaker(text)
-            sentences = [sent.text for sent in doc.sents if len(sent.text.strip()) > 0]
-            logger.info(f"Found {len(sentences)} sentences")
-            
-            embeddings = []
-            mapping = []
-            
-            # Process sentences in batches
-            for sentence in tqdm(sentences, desc="Creating embeddings"):
-                tokens = self.sent_tokenizer(sentence, return_tensors="pt", truncation=False)
-                tokens = tokens['input_ids'].squeeze(0)
-                
-                # Split long sentences into chunks
-                for i in range(0, len(tokens), 128-32):
-                    chunk_tokens = tokens[i:i+128]
-                    chunk_text = self.sent_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-                    
-                    # Skip empty chunks
-                    if not chunk_text.strip():
-                        continue
-                        
-                    chunk_tokens = self.sent_tokenizer(
-                        chunk_text, 
-                        return_tensors="pt", 
-                        truncation=False
-                    ).to(self.device)
-                    
-                    with torch.no_grad():
-                        embeded_text = self.sent_embeddings(**chunk_tokens).last_hidden_state.mean(dim=1)
-                    
-                    embeddings.append(embeded_text[0])
-                    mapping.append(sentence)
-            
-            if not embeddings:
-                raise ValueError("Failed to create any embeddings from the text")
-                
-            embeddings = torch.stack(embeddings).squeeze(1)
-            return embeddings, mapping
-        except Exception as e:
-            logger.error(f"Error creating embeddings: {str(e)}")
-            raise
-    
+
     def get_answer(self, question, k=5):
         """Generate an answer to a question using the RAG approach."""
         try:
-            if not self.mapping or self.db.ntotal == 0:
-                return "Please load a document first before asking questions."
+            if not self.vectorstore:
+                return "I cannot find a specific answer in the document."
             
             logger.info(f"Generating answer for question: {question}")
             
-            # Create embeddings for the question
-            question_embedding, _ = self.get_embeddings(question)
-            
-            # Retrieve relevant passages
-            indices = []
-            for embedding in question_embedding:
-                distances, index = self.db.search(
-                    embedding.cpu().numpy().reshape(1, -1), 
-                    min(k, self.db.ntotal)
-                )
-                indices.extend(index)
-            
-            # Get the retrieved sentences
-            retrieved_sentences = [self.mapping[i] for i in indices[0]]
-            context = " ".join(retrieved_sentences)
-            
-            logger.info(f"Retrieved {len(retrieved_sentences)} relevant passages")
-            
-            # Build prompt for the generator
-            prompt = f"Summarize the following text in detail: {context}. Question: {question}"
-            
-            # Generate answer
-            gen_tokens = self.generator_tokenizer(
-                prompt, 
-                return_tensors="pt",
-                max_length=512, 
-                truncation=True
-            ).to(self.device)
-            
-            gen_answer = self.generator.generate(
-                **gen_tokens, 
-                max_length=512, 
-                num_beams=4,
-                early_stopping=True
+            # Create QA chain with custom prompt
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                chain_type="stuff",
+                retriever=self.vectorstore.as_retriever(search_kwargs={"k": k}),
+                return_source_documents=True,
+                chain_type_kwargs={"prompt": self.pdf_qa_template}
             )
             
-            answer = self.generator_tokenizer.decode(gen_answer[0], skip_special_tokens=True)
-            logger.info("Answer generated successfully")
+            # Get answer
+            result = qa_chain({"query": question})
+            answer = result["result"]
             
+            # Check answer quality
+            if self._is_low_quality_answer(answer):
+                return "I cannot find a specific answer in the document."
+            
+            logger.info("Answer generated successfully")
             return answer
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
-            return f"Sorry, I encountered an error while generating an answer: {str(e)}"
+            return "I cannot find a specific answer in the document."
+
+    def summarize_text(self, text, max_length=512):
+        """Summarize a given text using the language model."""
+        try:
+            logger.info("Generating summary for text")
             
-# Initialize the RAG model if this file is run directly
-# if __name__ == "__main__":
-#     rag_model = RAG(
-#         sent_model_name="sentence-transformers/all-MiniLM-L6-v2",
-#         generator_model_name="google/flan-t5-base"
-#     )
+            # Create summarization chain
+            summarize_chain = LLMChain(
+                llm=self.llm,
+                prompt=self.summarize_template
+            )
+            
+            # Generate summary
+            summary = summarize_chain.run(text=text)
+            
+            logger.info("Summary generated successfully")
+            return summary
+        except Exception as e:
+            logger.error(f"Error generating summary: {str(e)}")
+            return f"Sorry, I encountered an error while generating the summary: {str(e)}"
+
+    def answer_general_question(self, question):
+        """Answer a general question without requiring PDF context."""
+        try:
+            logger.info(f"Answering general question: {question}")
+            
+            # Create general QA chain
+            qa_chain = LLMChain(
+                llm=self.llm,
+                prompt=self.general_qa_template
+            )
+            
+            # Generate answer
+            answer = qa_chain.run(question=question)
+            
+            logger.info("Answer generated successfully")
+            return answer
+        except Exception as e:
+            logger.error(f"Error generating answer: {str(e)}")
+            return "I apologize, but I'm having trouble generating an answer right now."
+
+    def summarize_pdf(self, pdf_path=None, max_chunks=10):
+        """Summarize the content of a PDF document."""
+        try:
+            # If no PDF path is provided, use the currently loaded PDF
+            if pdf_path:
+                self.load_pdf(pdf_path)
+            
+            if not self.vectorstore:
+                return "No document has been loaded for summarization."
+            
+            logger.info("Generating PDF summary")
+            
+            # Get all documents from the vector store
+            documents = self.vectorstore.get()
+            if not documents:
+                return "No content found in the document."
+            
+            # Combine text from documents
+            full_text = " ".join([doc.page_content for doc in documents[:max_chunks]])
+            
+            # Create PDF summary chain
+            pdf_summary_chain = LLMChain(
+                llm=self.llm,
+                prompt=self.pdf_summary_template
+            )
+            
+            # Generate summary
+            summary = pdf_summary_chain.run(text=full_text)
+            
+            logger.info("PDF summary generated successfully")
+            return summary
+        except Exception as e:
+            logger.error(f"Error generating PDF summary: {str(e)}")
+            return "I apologize, but I'm having trouble generating a summary right now."
+
+    def _is_low_quality_answer(self, answer):
+        """Check if an answer is of low quality."""
+        # Check for short answers
+        if len(answer.split()) < 10:
+            return True
+            
+        # Check for generic responses
+        generic_phrases = [
+            "i cannot find",
+            "i don't know",
+            "i'm not sure",
+            "i apologize",
+            "i'm having trouble",
+            "no specific answer",
+            "cannot find a specific answer"
+        ]
+        
+        answer_lower = answer.lower()
+        return any(phrase in answer_lower for phrase in generic_phrases)
+            

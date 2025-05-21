@@ -38,6 +38,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class ChatResponse(BaseModel):
     reply: str
+    source: str  # Indicates the source of the answer: "pdf", "general", or "summary"
+
+class SummaryResponse(BaseModel):
+    summary: str
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -69,11 +73,14 @@ async def chat(
     file: Optional[UploadFile] = File(None)
 ):
     """
-    Process a chat message and optionally upload a file.
+    Intelligent chat endpoint that handles all types of requests:
+    - PDF summarization
+    - PDF-based QA
+    - General QA
     """
     global document_loaded
     
-    # If a file is uploaded along with the message
+    # Handle file upload if provided
     if file:
         if not file.filename.endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -91,13 +98,86 @@ async def chat(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
     
-    # If no document has been loaded yet
+    try:
+        # Check if the message is a request for summarization
+        if "summarize" in message.lower():
+            if not document_loaded:
+                return ChatResponse(
+                    reply="Please upload a PDF document first so I can summarize it.",
+                    source="general"
+                )
+            summary = rag_model.summarize_pdf()
+            return ChatResponse(reply=summary, source="summary")
+        
+        # If PDF is loaded, try to answer from PDF first
+        if document_loaded:
+            pdf_answer = rag_model.get_answer(message)
+            
+            # If the answer seems too generic or short, use general QA
+            if len(pdf_answer.split()) < 10 or "sorry" in pdf_answer.lower():
+                general_answer = rag_model.answer_general_question(message)
+                return ChatResponse(reply=general_answer, source="general")
+            
+            return ChatResponse(reply=pdf_answer, source="pdf")
+        
+        # If no PDF is loaded, use general QA
+        general_answer = rag_model.answer_general_question(message)
+        return ChatResponse(reply=general_answer, source="general")
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
+
+@app.post("/api/summarize-text", response_model=SummaryResponse)
+async def summarize_text(text: str = Form(...)):
+    """
+    Summarize a given text.
+    """
+    try:
+        summary = rag_model.summarize_text(text)
+        return SummaryResponse(summary=summary)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
+
+@app.post("/api/summarize-pdf", response_model=SummaryResponse)
+async def summarize_pdf(file: Optional[UploadFile] = File(None)):
+    """
+    Summarize the currently loaded PDF or a newly uploaded PDF.
+    """
+    global document_loaded
+    
+    if file:
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        
+        file_path = f"uploads/{file.filename}"
+        
+        # Save the uploaded file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        try:
+            summary = rag_model.summarize_pdf(file_path)
+            document_loaded = True
+            return SummaryResponse(summary=summary)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    
     if not document_loaded:
-        return ChatResponse(reply="Please upload a PDF document first so I can answer questions about it.")
+        raise HTTPException(status_code=400, detail="No PDF document has been loaded")
     
     try:
-        # Generate answer using the RAG model
-        answer = rag_model.get_answer(message)
+        summary = rag_model.summarize_pdf()
+        return SummaryResponse(summary=summary)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
+
+@app.post("/api/general-qa", response_model=ChatResponse)
+async def general_qa(question: str = Form(...)):
+    """
+    Answer a general question without requiring PDF context.
+    """
+    try:
+        answer = rag_model.answer_general_question(question)
         return ChatResponse(reply=answer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")

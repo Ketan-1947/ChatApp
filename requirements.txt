@@ -1,27 +1,13 @@
-# Web framework
-fastapi==0.110.0
-uvicorn==0.27.1
-python-multipart==0.0.9
-
-# PDF processing
-pypdf==4.1.0
-
-# NLP processing
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+langchain==0.0.350
+transformers==4.35.2
+torch==2.1.1
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
 spacy==3.7.2
-# Run separately: python -m spacy download en_core_web_sm
-
-# Vector database
-faiss-cpu==1.8.0
-
-# Transformer models (installed after PyTorch)
-transformers==4.39.0
-sentence-transformers==2.3.1
-accelerate==0.26.1
-
-# Optional visualization and utilities
-matplotlib==3.8.3
-pandas==2.2.0
-tqdm==4.66.2
-
-# Optional caching
-diskcache==5.6.3
+pypdf==3.17.1
+tqdm==4.66.1
+numpy==1.26.2
+python-dotenv==1.0.0 
